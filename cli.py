@@ -4414,9 +4414,19 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
             })
             previous_speaker = speakers[index] if index < len(speakers) else previous_speaker
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with wave.open(str(output_path), "wb") as output:
+        output = wave.open(str(output_path), "wb")
+        try:
             output.setparams(params)
             output.writeframes(b"".join(chunks))
+        except BaseException:
+            # Preserve the primary write/setup failure, including interruption.
+            try:
+                output.close()
+            except BaseException:
+                pass
+            raise
+        else:
+            output.close()
         return timeline
 
     @staticmethod
