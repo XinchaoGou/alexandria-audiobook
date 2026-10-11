@@ -4370,54 +4370,88 @@ character_updates 只记录本章对已有人物长期说话方式/身份的补�
     ) -> List[Dict[str, int]]:
         if not line_paths:
             raise PipelineError("没有可合并的音频行")
+        # Bound PCM storage to one block; retain the first input's exact format.
         try:
             with wave.open(str(line_paths[0]), "rb") as first:
                 params = first.getparams()
-                first_frames = first.readframes(first.getnframes())
         except (wave.Error, OSError) as exc:
             raise PipelineError(f"音频行必须是 WAV（{line_paths[0]}：{exc}）") from exc
         frame_width = params.nchannels * params.sampwidth
-        chunks = [first_frames]
-        cursor_frames = params.nframes
-        timeline: List[Dict[str, int]] = [{
-            "line_id": 1,
-            "start_ms": 0,
-            "end_ms": int(round(params.nframes * 1000 / params.framerate)),
-        }]
+        block_frames = max(1, min(16384, 65536 // frame_width))
+        cursor_frames = 0
+        timeline: List[Dict[str, int]] = []
         previous_speaker = speakers[0] if speakers else ""
-        for index, path in enumerate(line_paths[1:], 1):
-            gap = pauses[index - 1] if index - 1 < len(pauses) else None
-            if gap is None:
-                gap = same_pause_ms if speakers[index] == previous_speaker else pause_ms
-            frames_of_silence = int(max(0, int(gap)) * params.framerate / 1000)
-            chunks.append(b"\x00" * frames_of_silence * frame_width)
-            cursor_frames += frames_of_silence
-            try:
-                with wave.open(str(path), "rb") as current:
-                    if (
-                        current.getnchannels() != params.nchannels
-                        or current.getsampwidth() != params.sampwidth
-                        or current.getframerate() != params.framerate
-                        or current.getcomptype() != params.comptype
-                    ):
-                        raise PipelineError(f"音频行参数不一致：{path}")
-                    current_frames = current.getnframes()
-                    chunks.append(current.readframes(current_frames))
-            except (wave.Error, OSError) as exc:
-                raise PipelineError(f"无法读取音频行 {path}: {exc}") from exc
-            start_ms = int(round(cursor_frames * 1000 / params.framerate))
-            cursor_frames += current_frames
-            timeline.append({
-                "line_id": index + 1,
-                "start_ms": start_ms,
-                "end_ms": int(round(cursor_frames * 1000 / params.framerate)),
-            })
-            previous_speaker = speakers[index] if index < len(speakers) else previous_speaker
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with wave.open(str(output_path), "wb") as output:
-            output.setparams(params)
-            output.writeframes(b"".join(chunks))
+        # A late bad input must leave any prior output untouched. Own a unique
+        # staging directory on the destination filesystem for atomic publication.
+        with tempfile.TemporaryDirectory(prefix=".merge-wav-", dir=output_path.parent) as directory:
+            staged = Path(directory) / "output.wav"
+            output = wave.open(str(staged), "wb")
+            try:
+                output.setparams(params)
+                silence = b"\x00" * block_frames * frame_width
+                for index, path in enumerate(line_paths):
+                    if index:
+                        gap = pauses[index - 1] if index - 1 < len(pauses) else None
+                        if gap is None:
+                            gap = same_pause_ms if speakers[index] == previous_speaker else pause_ms
+                        frames_of_silence = int(max(0, int(gap)) * params.framerate / 1000)
+                        cursor_frames += frames_of_silence
+                        while frames_of_silence:
+                            count = min(frames_of_silence, block_frames)
+                            output.writeframesraw(silence[:count * frame_width])
+                            frames_of_silence -= count
+                    try:
+                        current = wave.open(str(path), "rb")
+                    except (wave.Error, OSError) as exc:
+                        if index == 0:
+                            raise PipelineError(f"音频行必须是 WAV（{path}：{exc}）") from exc
+                        raise PipelineError(f"无法读取音频行 {path}: {exc}") from exc
+                    with current:
+                        if (
+                            current.getnchannels() != params.nchannels
+                            or current.getsampwidth() != params.sampwidth
+                            or current.getframerate() != params.framerate
+                            or current.getcomptype() != params.comptype
+                        ):
+                            raise PipelineError(f"音频行参数不一致：{path}")
+                        current_frames = current.getnframes()
+                        remaining_bytes = current_frames * frame_width
+                        while remaining_bytes:
+                            try:
+                                data = current.readframes(min(
+                                    block_frames, (remaining_bytes + frame_width - 1) // frame_width
+                                ))
+                            except (wave.Error, OSError) as exc:
+                                if index == 0:
+                                    raise PipelineError(f"音频行必须是 WAV（{path}：{exc}）") from exc
+                                raise PipelineError(f"无法读取音频行 {path}: {exc}") from exc
+                            if not data:
+                                break
+                            output.writeframesraw(data)
+                            remaining_bytes -= len(data)
+                    # Preserve legacy truncated-WAV acceptance: copy available
+                    # bytes, but use declared frame counts for SFX timestamps.
+                    start_ms = int(round(cursor_frames * 1000 / params.framerate))
+                    cursor_frames += current_frames
+                    timeline.append({
+                        "line_id": index + 1,
+                        "start_ms": start_ms,
+                        "end_ms": int(round(cursor_frames * 1000 / params.framerate)),
+                    })
+                    previous_speaker = speakers[index] if index < len(speakers) else previous_speaker
+            except BaseException:
+                # Discard staged output without masking a write/read interruption.
+                try:
+                    output.close()
+                except BaseException:
+                    pass
+                raise
+            else:
+                output.close()
+            os.replace(staged, output_path)
         return timeline
+
 
     @staticmethod
     def _convert_audio_to_m4b(
